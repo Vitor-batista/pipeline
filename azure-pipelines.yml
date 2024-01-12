@@ -1,0 +1,265 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+pool: Sales Force Default
+
+trigger:
+  batch: "true"
+  branches:
+    include:
+      - sandboxes/*
+      - main
+  paths:
+    include:
+      - force-app/*
+
+resources:
+  repositories:
+    - repository: pipeline
+      type: git
+      name: PipelineDevelopment/PipelineDevelopment
+      ref: chore/sfUpdates
+
+variables:
+    - group: ReleasePipelineVars
+
+stages:
+    - stage: pr_qa
+      displayName: Validate PR
+      condition: eq(variables['Build.Reason'], 'PullRequest')
+      jobs:
+        - job: Deploy
+          continueOnError: true
+          variables:
+            branch: $[replace(replace(variables['System.PullRequest.TargetBranch'], 'refs/heads/', ''), 'sandboxes/', '')]
+            oldSha:
+            authLink:
+            userAlias:
+            manifestDirectory:
+            testsFlag:
+          steps:
+            - checkout: pipeline
+            - task: UseNode@1
+              inputs:
+                version: '17.9.0'
+            - powershell: |
+                # Get whether is installed
+                $uninstallSfdx = $true
+                try {
+                  sfdx version
+                }
+                Catch {
+                  $uninstallSfdx = $false
+                }
+
+                # Uninstall sfdx
+                if ( $uninstallSfdx )
+                {
+                  echo "Uninstall run"
+                  npm uninstall sfdx-cli --global
+                }
+
+                # Install sf
+                npm install @salesforce/cli --global
+              displayName: Update cli to sf
+            - bash: echo y | sf plugins install sfdx-git-delta
+              displayName: Install DeltaPackage
+            - powershell: |
+                echo "`nbranch: $(branch)"
+
+                # Get brach and org values
+                $base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(("{0}:{1}" -f "$(token)","")))
+                $baseUri = "$(collectionurl)/$(project)/_apis/distributedtask/variablegroups/$(variablegroupid)?api-version=5.0-preview.1"
+                $vgresponse = Invoke-RestMethod -Method Get -Uri $baseUri -Headers @{Authorization=("Basic {0}" -f $base64AuthInfo)}
+                $oldSha = $vgresponse.variables."$(branch)_SHA".value
+
+                # Get job variables
+                $authLink = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes( $vgresponse.variables."$(branch)_SFDX_AUTH_URL".value ))
+                  Write-Host "##vso[task.setvariable variable=authLink]$authLink"
+                $userAlias = "$(Build.Repository.Name)_$(branch)"
+                  Write-Host "##vso[task.setvariable variable=userAlias]$userAlias"
+                $manifestDirectory = "toDeploy$userAlias"
+                  Write-Host "##vso[task.setvariable variable=manifestDirectory]$manifestDirectory"
+
+                # Show result
+                echo @"
+                `n
+                oldSHA: $oldSha
+                authLink: $authLink
+                userAlias: $userAlias
+                manifestDirectory: $manifestDirectory
+                `n
+                "@
+
+                # Get changed files
+                $files = $(git diff --no-commit-id --name-only -r --diff-filter=ACMT -r $oldSha)
+                $temp = $files.Split([Environment]::NewLine)
+                $count = $temp.Length
+
+                # Get test classes to run and echo files
+                echo "`n`nTotal changed files: $count"
+                For ($i=0; $i -lt $temp.Length; $i++)
+                {
+                  $name = $temp[$i]
+
+                  echo "** $name"
+
+                  if ($name -like 'testClassExecution/*')
+                  {
+                    $testClassesToRun += Get-Content -Path $(system.defaultworkingdirectory)\$name
+                  }
+                }
+
+                # Build and assign test flag
+                $testsFlag = "test " + $testClassesToRun -replace '[\s,]+', ' '
+                Write-Host "##vso[task.setvariable variable=testsFlag;]$testsFlag"
+
+                # Show test class flag
+                echo "* --tests: $testsFlag"
+
+                # Run delta
+                New-Item -Path "." -Name "$manifestDirectory" -ItemType "directory" -Force
+                sfdx sgd:source:delta --to "HEAD" --from $oldSha --output "./$manifestDirectory"
+              displayName: GetChangedSource
+            - bash: |
+                echo $(authLink) | base64 --decode > authfile
+                echo $(authLink) | base64 --decode
+                sf org login sfdx-url --sfdx-url-file authfile --alias "$(userAlias)"
+              displayName: Authenticate to QA
+            - bash: sf project deploy validate --test-level RunSpecifiedTests --tests $(testsFlag) --manifest "./$(manifestDirectory)/package/package.xml" --target-org "$(userAlias)" --wait 60 --verbose
+              displayName: Run validation on source code
+    - stage: qa
+      displayName: Deploy
+      condition: ne(variables['Build.Reason'], 'PullRequest')
+      jobs:
+        - job: Deploy
+          variables:
+            branch: $[replace(replace(variables['Build.SourceBranch'], 'refs/heads/', ''), 'sandboxes/', '')]
+            oldSha:
+            authLink:
+            userAlias:
+            manifestDirectory:
+            testsFlag:
+          steps:
+            - checkout: pipeline
+            - task: UseNode@1
+              inputs:
+                version: '17.9.0'
+            - powershell: |
+                # Get wheter is installed
+                $uninstallSfdx = $true
+                try {
+                  sfdx version
+                }
+                Catch {
+                  $uninstallSfdx = $false
+                }
+
+                # Uninstall sfdx
+                if ( $uninstallSfdx )
+                {
+                  echo "Uninstall run"
+                  npm uninstall sfdx-cli --global
+                }
+
+                # Install sf
+                npm install @salesforce/cli --global
+              displayName: Update cli to sf
+            - bash: echo y | sf plugins install sfdx-git-delta
+              displayName: Install DeltaPackage
+            - powershell: |
+                echo "`nbranch: $(branch)"
+
+                # Get brach and org values
+                $base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(("{0}:{1}" -f "$(token)","")))
+                $baseUri = "$(collectionurl)/$(project)/_apis/distributedtask/variablegroups/$(variablegroupid)?api-version=5.0-preview.1"
+                $vgresponse = Invoke-RestMethod -Method Get -Uri $baseUri -Headers @{Authorization=("Basic {0}" -f $base64AuthInfo)}
+                $oldSha = $vgresponse.variables."$(branch)_SHA".value
+
+                # Get job variables
+                $authLink = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes( $vgresponse.variables."$(branch)_SFDX_AUTH_URL".value ))
+                  Write-Host "##vso[task.setvariable variable=authLink]$authLink"
+                $userAlias = "$(Build.Repository.Name)_$(branch)"
+                  Write-Host "##vso[task.setvariable variable=userAlias]$userAlias"
+                $manifestDirectory = "toDeploy$userAlias"
+                  Write-Host "##vso[task.setvariable variable=manifestDirectory]$manifestDirectory"
+
+                # Show result
+                echo @"
+                `n
+                oldSHA: $oldSha
+                authLink: $authLink
+                userAlias: $userAlias
+                manifestDirectory: $manifestDirectory
+                `n
+                "@
+
+                # Get changed files
+                $files = $(git diff --no-commit-id --name-only -r --diff-filter=ACMT -r $oldSha)
+                $temp = $files.Split([Environment]::NewLine)
+                $count = $temp.Length
+
+                # Get test classes to run and echo files
+                echo "`n`nTotal changed files: $count"
+                For ($i=0; $i -lt $temp.Length; $i++)
+                {
+                  $name = $temp[$i]
+
+                  echo "** $name"
+
+                  if ($name -like 'testClassExecution/*')
+                  {
+                    $testClassesToRun += Get-Content -Path $(system.defaultworkingdirectory)\$name
+                  }
+                }
+
+                # Build and assign test flag
+                $testsFlag = "test " + $testClassesToRun -replace '[\s,]+', ' '
+                Write-Host "##vso[task.setvariable variable=testsFlag;]$testsFlag"
+
+                # Show test class flag
+                echo "* --tests: $testsFlag"
+
+                # Run delta
+                New-Item -Path "." -Name "$manifestDirectory" -ItemType "directory" -Force
+                sfdx sgd:source:delta --to "HEAD" --from $oldSha --output "./$manifestDirectory"
+              displayName: GetChangedSource
+            - bash: |
+                  echo "teste: $(authLink)"
+                  echo $(authLink) | base64 --decode > authfile
+                  echo $(authLink) | base64 --decode
+                  sfdx auth:sfdxurl:store -f authfile -a "$(Build.Repository.Name)_$(branch)"
+              displayName: Authenticate to QA
+            - bash: sf project deploy start --test-level RunSpecifiedTests --tests $(testsFlag) --manifest "./$(manifestDirectory)/package/package.xml" --target-org "$(userAlias)" --wait 60 --verbose --ignore-conflicts
+              displayName: Deploy source code to Dev Org
+        - job: SaveSucess
+          variables:
+            branch: $[replace(replace(variables['Build.SourceBranch'], 'refs/heads/', ''), 'sandboxes/', '')]
+          dependsOn: Deploy
+          condition: succeeded()
+          steps:
+            - checkout: self
+              persistCredentials: true
+            - powershell: |
+                $variableName = "$(branch)_SHA"
+                echo "$variableName"
+                # Base64-encodes the Personal Access Token (PAT) appropriately
+                $base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(("{0}:{1}" -f "$(token)","")))
+                $baseUri = "$(collectionurl)/$(project)/_apis/distributedtask/variablegroups/$(variablegroupid)?api-version=5.0-preview.1"
+                $vgresponse = Invoke-RestMethod -Method Get -Uri $baseUri -Headers @{Authorization=("Basic {0}" -f $base64AuthInfo)}
+                # Set new value for the specific variable
+                $vgresponse.variables.$variableName.value = "$(Build.SourceVersion)"
+                ####****************** update the modified object **************************
+                $json = @($vgresponse) | ConvertTo-Json -Depth 99
+                echo "$json"
+                echo "$baseUri"
+                echo "$base64AuthInfo"
+                $updatedvg = Invoke-RestMethod -Method Put -Uri $baseUri -Headers @{Authorization=("Basic {0}" -f $base64AuthInfo)} -ContentType "application/json" -Body ([System.Text.Encoding]::UTF8.GetBytes($json)) | Out-Null
+                #$updatedvg = Invoke-RestMethod -Uri $baseUri -Method Put -Body $json -ContentType "application/json" -Headers @{Authorization=("Basic {0}" -f $base64AuthInfo)}
+                Cls
+                write-host "=========================================================="
+                Write-host "The value of Varialbe '$variableName' is updated to" $updatedvg.variables.$variableName.value
+                write-host "=========================================================="
+              displayName: Save successful SHA
